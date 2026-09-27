@@ -660,8 +660,10 @@ curl -s -X POST http://localhost:8080/v1/records/minimize \
 批量操作（`/v1/issuance/route` 容量分配、`/v1/authorize/patch-plan` 补丁规划、
 `/v1/authorize/change-impact` 变更影响、`/v1/records/minimize` 记录精简、
 `/v1/authorize/rollout-window` 灰度窗口）在单次操作中对每个基线、新版或候选记录组
-**至多准备一次**，该组的全部查询复用同一快照；搜索过程中的无效候选
-（同名混用、多条 CNAME、成环、超 8 跳、超 100 条）仍按原规则跳过。
+**至多准备一次**，该组的全部查询复用同一快照；搜索再次访问同一记录组时
+（如 change-impact 枚举到完整编辑子集、minimize 枚举到全量子序列、rollout-window
+枚举到全旧 / 全新组合）也直接复用已准备的快照，不再重复规范化与校验；搜索过程中的
+无效候选（同名混用、多条 CNAME、成环、超 8 跳、超 100 条）仍按原规则跳过。
 
 ## 示例
 
@@ -774,6 +776,7 @@ tests/
   test_issuance_route.py  # 24 条批量签发路由用例（pytest + TestClient）
   test_import_zone.py     # 45 条 zone 导入用例
   test_minimize.py        # 26 条记录集精简（minimize）用例
+  test_prepare_reuse.py   # 6 条重复准备回归用例（prepare_records 每次请求每组至多一次）
   test_rollout_window.py  # 26 条快照切换安全窗口（rollout-window）用例
 Dockerfile
 docker-compose.yml

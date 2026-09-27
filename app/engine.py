@@ -405,15 +405,37 @@ def _decide(
     }
 
 
-def _evaluator_for(records: list[dict]):
+def _records_key(records: list[dict]) -> tuple:
+    """Hashable fingerprint of a raw record group, order included.
+
+    Used as the snapshot-cache key inside one batch operation: two
+    groups with the same fingerprint normalize to the same
+    :class:`PreparedRecords`, so the snapshot (or the preparation
+    failure) of the first is reused for the second. Record dicts only
+    carry strings and ints, so the sorted-items tuple is hashable.
+    """
+    return tuple(tuple(sorted(rec.items())) for rec in records)
+
+
+def _evaluator_for(
+    records: list[dict],
+    cache: Optional[dict[tuple, object]] = None,
+):
     """Return an evaluate-like callable sharing one prepared snapshot.
 
     The first call normalizes the query names and then prepares the
     record set — the same validation order as :func:`evaluate` — and
     caches the immutable :class:`PreparedRecords` index; later calls
-    reuse it. Batch operations build one such evaluator per record group
-    (baseline, new version, candidate), so each group is prepared at
-    most once no matter how many queries run against it.
+    reuse it. When ``cache`` (a dict local to one batch operation) is
+    given, the outcome is additionally keyed by the record group's
+    content: a group already prepared anywhere in the operation —
+    baseline, new version or an earlier candidate — is not normalized
+    and validated again, and a group whose preparation already failed
+    raises the same :class:`CAAError` again without re-running
+    :func:`prepare_records`. Batch operations build one such evaluator
+    per record group, so each distinct group is prepared at most once
+    per operation no matter how many queries or search rounds run
+    against it.
     """
     snapshot: list[PreparedRecords] = []
 
@@ -421,7 +443,22 @@ def _evaluator_for(records: list[dict]):
         qname = normalize_name(domain, field="domain")
         ca_name = normalize_name(ca, field="ca")
         if not snapshot:
-            snapshot.append(prepare_records(records))
+            if cache is None:
+                snapshot.append(prepare_records(records))
+            else:
+                key = _records_key(records)
+                if key not in cache:
+                    try:
+                        cache[key] = prepare_records(records)
+                    except CAAError as exc:
+                        # A group that fails to prepare fails for every
+                        # later visit too; reuse the failure.
+                        cache[key] = exc
+                        raise
+                prepared = cache[key]
+                if isinstance(prepared, CAAError):
+                    raise prepared
+                snapshot.append(prepared)
         return _decide(qname, wildcard, ca_name, snapshot[0])
 
     return run
@@ -723,10 +760,17 @@ def change_impact(
     def verdict_for(run, q: dict) -> dict:
         return run(q["domain"], q.get("wildcard", False), q["ca"])
 
+    # One snapshot cache shared by the baseline, the new version and
+    # every candidate subset: each distinct record group is prepared at
+    # most once per request, and a group the search revisits — such as
+    # the full edit set, which is also enumerated as a candidate subset —
+    # reuses the snapshot built on its first visit.
+    cache: dict[tuple, object] = {}
+
     # Baseline: one evaluator prepares the existing record set on first
     # use and every query reuses the snapshot, so the set is fully
     # exercised by the same name/record/alias rules as /v1/authorize.
-    before_eval = _evaluator_for(records)
+    before_eval = _evaluator_for(records, cache)
     before: list[dict] = [verdict_for(before_eval, q) for q in queries]
 
     new_records = apply_edits(records, edits)
@@ -735,7 +779,7 @@ def change_impact(
             f"record set after edits has {len(new_records)} records; "
             f"at most {MAX_RECORDS} allowed"
         )
-    after_eval = _evaluator_for(new_records)
+    after_eval = _evaluator_for(new_records, cache)
     after: list[dict] = [verdict_for(after_eval, q) for q in queries]
 
     flips: list[dict] = []
@@ -756,9 +800,13 @@ def change_impact(
                 if len(sub_records) > MAX_RECORDS:
                     continue
                 try:
-                    # Each candidate record group is prepared once;
-                    # invalid candidates are skipped, not reported.
-                    sub_verdict = verdict_for(_evaluator_for(sub_records), q)
+                    # Each candidate record group is prepared once per
+                    # request (the cache also covers the full edit set,
+                    # already prepared as the new version); invalid
+                    # candidates are skipped, not reported.
+                    sub_verdict = verdict_for(
+                        _evaluator_for(sub_records, cache), q
+                    )
                 except CAAError:
                     continue
                 if sub_verdict["authorized"] == a["authorized"]:
@@ -805,10 +853,16 @@ def minimize_records(
         verdict = run(q["domain"], q.get("wildcard", False), q["ca"])
         return verdict["authorized"], verdict["effective_owner"]
 
+    # One snapshot cache shared by the baseline and every candidate
+    # subsequence: each distinct record group is prepared at most once
+    # per request, and a group the search revisits — such as the full
+    # subsequence, which equals the baseline — reuses the snapshot.
+    cache: dict[tuple, object] = {}
+
     # Baseline: one evaluator prepares the full record set on first use
     # and every query reuses the snapshot, so the existing name/record/
     # alias rules surface exactly as in /v1/authorize.
-    baseline_eval = _evaluator_for(records)
+    baseline_eval = _evaluator_for(records, cache)
     baselines = [pair_for(baseline_eval, q) for q in queries]
 
     n = len(records)
@@ -817,9 +871,10 @@ def minimize_records(
         for subset in combinations(range(n), size):
             sub_records = [records[i] for i in subset]
             try:
-                # Each candidate subsequence is prepared once and reused
-                # for every query; invalid candidates are skipped.
-                sub_eval = _evaluator_for(sub_records)
+                # Each candidate subsequence is prepared once per
+                # request and reused for every query; invalid
+                # candidates are skipped.
+                sub_eval = _evaluator_for(sub_records, cache)
                 if all(
                     pair_for(sub_eval, q) == baseline
                     for q, baseline in zip(queries, baselines)
@@ -893,11 +948,14 @@ def rollout_window(
 
     # Both snapshots must be fully valid for every query; any name, record
     # or alias failure surfaces exactly as in /v1/authorize. Each snapshot
-    # gets one evaluator, prepared on first use and reused for its queries.
-    before_eval = _evaluator_for(before)
+    # gets one evaluator, prepared on first use and reused for its queries;
+    # both share one snapshot cache with the mixed combinations below, so
+    # a record group is prepared at most once per request.
+    cache: dict[tuple, object] = {}
+    before_eval = _evaluator_for(before, cache)
     for q in queries:
         pair_for(before_eval, q)
-    after_eval = _evaluator_for(after)
+    after_eval = _evaluator_for(after, cache)
     baseline = [pair_for(after_eval, q) for q in queries]
 
     def owner_of(rec: dict) -> str:
@@ -964,14 +1022,14 @@ def rollout_window(
         )
         return recs
 
-    def mix_failure(recs: list[dict]) -> Optional[dict]:
-        # Each mixed snapshot is prepared once and reused for every query.
-        # A record/alias failure makes the mix unsafe without naming a
+    def mix_failure(run) -> Optional[dict]:
+        # The mixed snapshot's evaluator prepares its record group once
+        # (or reuses the shared cache) and serves every query. A
+        # record/alias failure makes the mix unsafe without naming a
         # query; a verdict mismatch names the first failing query.
         try:
-            mix_eval = _evaluator_for(recs)
             for q, base in zip(queries, baseline):
-                pair = pair_for(mix_eval, q)
+                pair = pair_for(run, q)
                 if pair != base:
                     return {"query_id": q["id"], "error": None}
         except CAAError as exc:
@@ -983,7 +1041,17 @@ def rollout_window(
     first_unsafe: Optional[dict] = None
     for mask in range(1 << k):
         old_owners = {changed[i] for i in range(k) if mask & (1 << i)}
-        failure = mix_failure(mixed_records(old_owners))
+        if not old_owners:
+            # Mask 0 is the all-new snapshot: reuse its evaluator.
+            failure = mix_failure(after_eval)
+        elif old_owners == changed_set:
+            # Every changed owner stale is the all-old snapshot: reuse
+            # its evaluator instead of re-preparing the same records.
+            failure = mix_failure(before_eval)
+        else:
+            failure = mix_failure(
+                _evaluator_for(mixed_records(old_owners), cache)
+            )
         if failure is None:
             continue
         # Mask 0 is the all-new snapshot and never fails, so old_owners is
